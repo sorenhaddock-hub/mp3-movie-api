@@ -8,6 +8,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
 from src import (
     HealthResponse,
+    MovieCache,
     MovieDataResponse,
     MovieProcessingReport,
     MovieStorage,
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Movie API", version="1.0.0")
 app.middleware("http")(log_requests)
 storage = MovieStorage()
+cache = MovieCache()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -35,7 +37,6 @@ def health_check():
 @app.post("/upload", response_model=MovieUploadInfo)
 async def upload_movies(file: UploadFile = File(...)):
     """Read a movie CSV and replace the stored collection."""
-    # 1. Extension check and parsing (same as MP2)
     suffix = Path(file.filename or "").suffix.lower()
     if suffix != ".csv":
         logger.warning("Unsupported file format: %s", suffix or "(no extension)")
@@ -60,7 +61,6 @@ async def upload_movies(file: UploadFile = File(...)):
             detail="Could not decode the file. Make sure it is a UTF-8 encoded CSV.",
         )
 
-    # 2. Quick validation: exactly the movie columns, at least one row
     if sorted(df.columns) != sorted(MOVIE_COLUMNS):
         logger.warning("Wrong columns in %s: %s", file.filename, list(df.columns))
         raise HTTPException(
@@ -73,8 +73,8 @@ async def upload_movies(file: UploadFile = File(...)):
 
     df = df[MOVIE_COLUMNS]
 
-    # 3. Replace the stored collection
     storage.save(df)
+    cache.invalidate()
     logger.info("Uploaded movies: filename=%s, rows=%d", file.filename, len(df))
     return {
         "filename": file.filename,
@@ -86,11 +86,22 @@ async def upload_movies(file: UploadFile = File(...)):
 
 @app.get("/movies", response_model=MovieDataResponse)
 def get_movies(limit: int = Query(default=100, ge=1)):
-    """Return up to limit stored movies and the total count."""
+    """Return up to limit stored movies and the total count (cached)."""
+    # 1. Check the cache first
+    cached = cache.get(limit)
+    if cached is not None:
+        logger.info("Cache hit: limit=%d", limit)
+        return cached
+
+    # 2. Cache miss: read from SQLite (same as Part 1)
     data = storage.select_columns(MOVIE_COLUMNS, limit=limit)
     total_rows = storage.count_movies()
-    logger.info("Retrieved movies: returned_rows=%d, total_rows=%d", len(data), total_rows)
-    return {"data": data, "total_rows": total_rows}
+    response = {"data": data, "total_rows": total_rows}
+
+    # 3. Save the full response in the cache, then return it
+    cache.set(limit, response)
+    logger.info("Retrieved movies: returned_rows=%d", len(data))
+    return response
 
 
 @app.get("/movies/search", response_model=list[dict])
@@ -99,7 +110,7 @@ def query_movies(
     min_rating: float = Query(default=0, ge=0, le=10),
     limit: int = Query(default=100, ge=1)
 ):
-    """Return selected fields for movies at or above min_rating."""
+    """Return selected fields for movies at or above min_rating (not cached)."""
     try:
         results = storage.query_movies(columns, min_rating, limit)
     except ValueError as error:
@@ -116,13 +127,11 @@ def query_movies(
 @app.post("/movies/process", response_model=MovieProcessingReport)
 def process_movies(config: ProcessConfig):
     """Validate and process the stored movies using MP1 functions."""
-    # 1. Retrieve
     df = storage.get()
     if df.empty:
         logger.warning("No movies to process")
         raise HTTPException(status_code=400, detail="No movies stored. Upload a CSV first.")
 
-    # 2. Same validation/processing flow as MP2
     config_dict = config.model_dump()
     required_columns = config_dict["validation"]["required_columns"]
     numeric_columns = config_dict["validation"]["numeric_columns"]
@@ -152,8 +161,8 @@ def process_movies(config: ProcessConfig):
         logger.warning("Processing failed: %s", error)
         raise HTTPException(status_code=400, detail=str(error))
 
-    # 3. Save only after everything succeeded
     storage.save(processed)
+    cache.invalidate()
 
     report = {key: int(value) for key, value in cleaning_report.items()}
     logger.info(
