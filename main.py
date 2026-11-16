@@ -1,5 +1,4 @@
 import io
-import json
 import logging
 from pathlib import Path
 
@@ -8,21 +7,23 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
 from src import (
-    DatasetInfo,
-    DatasetStorage,
     HealthResponse,
+    MovieDataResponse,
+    MovieProcessingReport,
+    MovieStorage,
+    MovieUploadInfo,
     ProcessConfig,
-    ProcessingReport,
     log_requests,
     setup_logging,
 )
+from src.storage import MOVIE_COLUMNS
 
 setup_logging(verbose=True)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Data Processing API", version="1.0.0")
+app = FastAPI(title="Movie API", version="1.0.0")
 app.middleware("http")(log_requests)
-storage = DatasetStorage()
+storage = MovieStorage()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -31,9 +32,10 @@ def health_check():
     return {"status": "ok", "version": "1.0.0"}
 
 
-@app.post("/upload", response_model=DatasetInfo)
-async def upload_dataset(file: UploadFile = File(...)):
-    """Read and store a CSV upload."""
+@app.post("/upload", response_model=MovieUploadInfo)
+async def upload_movies(file: UploadFile = File(...)):
+    """Read a movie CSV and replace the stored collection."""
+    # 1. Extension check and parsing (same as MP2)
     suffix = Path(file.filename or "").suffix.lower()
     if suffix != ".csv":
         logger.warning("Unsupported file format: %s", suffix or "(no extension)")
@@ -58,94 +60,109 @@ async def upload_dataset(file: UploadFile = File(...)):
             detail="Could not decode the file. Make sure it is a UTF-8 encoded CSV.",
         )
 
-    dataset_id = storage.save(df, file.filename)
+    # 2. Quick validation: exactly the movie columns, at least one row
+    if sorted(df.columns) != sorted(MOVIE_COLUMNS):
+        logger.warning("Wrong columns in %s: %s", file.filename, list(df.columns))
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV must have exactly these columns: {MOVIE_COLUMNS}",
+        )
+    if df.empty:
+        logger.warning("CSV has no data rows: %s", file.filename)
+        raise HTTPException(status_code=400, detail="The CSV has no data rows.")
+
+    df = df[MOVIE_COLUMNS]
+
+    # 3. Replace the stored collection
+    storage.save(df)
+    logger.info("Uploaded movies: filename=%s, rows=%d", file.filename, len(df))
+    return {
+        "filename": file.filename,
+        "rows": len(df),
+        "columns": len(df.columns),
+        "column_names": list(df.columns),
+    }
+
+
+@app.get("/movies", response_model=MovieDataResponse)
+def get_movies(limit: int = Query(default=100, ge=1)):
+    """Return up to limit stored movies and the total count."""
+    data = storage.select_columns(MOVIE_COLUMNS, limit=limit)
+    total_rows = storage.count_movies()
+    logger.info("Retrieved movies: returned_rows=%d, total_rows=%d", len(data), total_rows)
+    return {"data": data, "total_rows": total_rows}
+
+
+@app.get("/movies/search", response_model=list[dict])
+def query_movies(
+    columns: list[str] = Query(default=["title"]),
+    min_rating: float = Query(default=0, ge=0, le=10),
+    limit: int = Query(default=100, ge=1)
+):
+    """Return selected fields for movies at or above min_rating."""
+    try:
+        results = storage.query_movies(columns, min_rating, limit)
+    except ValueError as error:
+        logger.warning("Invalid search: %s", error)
+        raise HTTPException(status_code=400, detail=str(error))
+
     logger.info(
-        "Uploaded dataset: id=%d, filename=%s, rows=%d",
-        dataset_id, file.filename, len(df),
+        "Queried movies: columns=%s, min_rating=%s, returned_rows=%d",
+        columns, min_rating, len(results),
     )
-    return storage.get_metadata(dataset_id)
+    return results
 
 
-@app.get("/datasets/{dataset_id}")
-def get_dataset(dataset_id: int, limit: int = Query(default=100, ge=1)):
-    """Return up to limit rows from a stored dataset."""
-    df = storage.get(dataset_id)
-    if df is None:
-        logger.warning("Dataset not found: %d", dataset_id)
-        raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found.")
+@app.post("/movies/process", response_model=MovieProcessingReport)
+def process_movies(config: ProcessConfig):
+    """Validate and process the stored movies using MP1 functions."""
+    # 1. Retrieve
+    df = storage.get()
+    if df.empty:
+        logger.warning("No movies to process")
+        raise HTTPException(status_code=400, detail="No movies stored. Upload a CSV first.")
 
-    records = json.loads(df.head(limit).to_json(orient="records"))
-    logger.info("Retrieved dataset: id=%d, returned_rows=%d", dataset_id, len(records))
-    return {"id": dataset_id, "data": records, "total_rows": len(df)}
-
-
-@app.post(
-    "/datasets/{dataset_id}/process",
-    response_model=ProcessingReport
-)
-def process_dataset(dataset_id: int, config: ProcessConfig):
-    """Validate and process a stored dataset using MP1 functions."""
-    # 1. Retrieve (outside the try block so a 404 stays a 404)
-    df = storage.get(dataset_id)
-    if df is None:
-        logger.warning("Dataset not found: %d", dataset_id)
-        raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found.")
-
-    # 2. Convert request model to the dict structure MP1 expects
+    # 2. Same validation/processing flow as MP2
     config_dict = config.model_dump()
     required_columns = config_dict["validation"]["required_columns"]
     numeric_columns = config_dict["validation"]["numeric_columns"]
 
-    # 3. Every numeric column must exist
     missing_numeric = [col for col in numeric_columns if col not in df.columns]
     if missing_numeric:
-        logger.warning(
-            "Numeric columns not found in dataset %d: %s", dataset_id, missing_numeric
-        )
+        logger.warning("Numeric columns not found: %s", missing_numeric)
         raise HTTPException(
             status_code=400,
-            detail=f"Numeric columns not found in dataset: {missing_numeric}",
+            detail=f"Numeric columns not found: {missing_numeric}",
         )
 
     try:
-        # 4. Validate
         rows_before_validation = len(df)
         validated = validate_dataframe(
             df,
             required_columns=required_columns,
             numeric_columns=numeric_columns,
         )
-        # 5. Record rows removed, then copy before processing
         validation_rows_removed = rows_before_validation - len(validated)
-        logger.info(
-            "Validated dataset: id=%d, validation_removed=%d",
-            dataset_id, validation_rows_removed,
-        )
+        logger.info("Validated movies: validation_removed=%d", validation_rows_removed)
         validated_copy = validated.copy()
 
-        # 6. Process with the full config
         processed = process_data(validated, config_dict)
-
-        # 7. Cleaning report: validated copy vs processed
         cleaning_report = create_cleaning_report(validated_copy, processed)
     except ValueError as error:
-        logger.warning("Processing failed for dataset %d: %s", dataset_id, error)
+        logger.warning("Processing failed: %s", error)
         raise HTTPException(status_code=400, detail=str(error))
 
-    # 8. Only update storage after everything succeeded
-    storage.update(dataset_id, processed)
+    # 3. Save only after everything succeeded
+    storage.save(processed)
 
     report = {key: int(value) for key, value in cleaning_report.items()}
     logger.info(
-        "Processed dataset: id=%d, validation_removed=%d, rows_before=%d, rows_after=%d",
-        dataset_id, validation_rows_removed,
+        "Processed movies: validation_removed=%d, rows_before=%d, rows_after=%d",
+        validation_rows_removed,
         report.get("rows_before", len(validated_copy)),
         report.get("rows_after", len(processed)),
     )
-
-    # 9. Return a dict matching ProcessingReport
     return {
-        "id": dataset_id,
         "validation_rows_removed": validation_rows_removed,
         "cleaning_report": report,
     }
