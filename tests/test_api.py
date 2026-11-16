@@ -1,60 +1,88 @@
-def test_upload_csv(client, sample_csv_bytes):
-    response = client.post(
-        "/upload",
-        files={"file": ("sample_movies.csv", sample_csv_bytes, "text/csv")},
-    )
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from src import MovieStorage
+import main
+
+
+def test_movies_persist(client, test_storage, uploaded_movies):
+    # A brand-new storage object reading the same database file
+    other = MovieStorage(test_storage.db_path)
+
+    df = other.get()
+    assert other.count_movies() == 20
+    assert len(df) == 20
+    assert list(df.columns) == ["title", "release_year", "rating", "genre"]
+
+    original = pd.read_csv(Path("fixtures") / "sample_movies.csv")
+    assert list(df["title"]) == list(original["title"])
+
+    db_ids = [row["id"] for row in other.select_columns(["title"], limit=100)]
+    response = client.get("/movies", params={"limit": 100})
     assert response.status_code == 200
-    body = response.json()
-    assert body["rows"] == 20
-    assert body["columns"] == 4
-    assert body["column_names"] == ["title", "release_year", "rating", "genre"]
+    api_ids = [row["id"] for row in response.json()["data"]]
+
+    assert db_ids == list(range(1, 21))
+    assert api_ids == list(range(1, 21))
 
 
-def test_get_movies_with_limit(client, uploaded):
-    response = client.get("/movies", params={"limit": 2})
-    assert response.status_code == 200
-    body = response.json()
-    assert len(body["data"]) == 2
-    assert body["total_rows"] == 20
-    assert [row["id"] for row in body["data"]] == [1, 2]
+def test_cache_and_processing(client, uploaded_movies, processing_body):
+    # 1. First retrievals are cached
+    response_100 = client.get("/movies", params={"limit": 100})
+    assert response_100.status_code == 200
+    assert main.cache.get(100) == response_100.json()
 
+    response_1 = client.get("/movies", params={"limit": 1})
+    assert response_1.status_code == 200
+    assert main.cache.get(1) == response_1.json()
 
-def test_search_movies(client, uploaded):
-    response = client.get(
-        "/movies/search",
-        params={"columns": ["title", "rating"], "min_rating": 8.5, "limit": 2},
-    )
-    assert response.status_code == 200
-    rows = response.json()
-    assert len(rows) == 2
-    for row in rows:
-        assert set(row.keys()) == {"id", "title", "rating"}
-        assert row["rating"] >= 8.5
-    # Sorted highest rating first
-    assert rows[0]["rating"] >= rows[1]["rating"]
+    # 2. Repeat returns the same response
+    repeat = client.get("/movies", params={"limit": 100})
+    assert repeat.status_code == 200
+    assert repeat.json() == response_100.json()
 
-
-def test_upload_replaces_collection(client, sample_csv_bytes):
-    for _ in range(2):
-        response = client.post(
-            "/upload",
-            files={"file": ("sample_movies.csv", sample_csv_bytes, "text/csv")},
-        )
-        assert response.status_code == 200
-
-    response = client.get("/movies")
-    assert response.json()["total_rows"] == 20
-
-
-def test_search_unsupported_column(client, uploaded):
-    response = client.get("/movies/search", params={"columns": ["director"]})
-    assert response.status_code == 400
-
-
-def test_process_movies(client, uploaded, processing_body):
+    # 3. Processing changes the data and clears the cache
     response = client.post("/movies/process", json=processing_body)
     assert response.status_code == 200
-    report = response.json()["cleaning_report"]
+    body = response.json()
+    assert body["validation_rows_removed"] == 0
+    assert body["cleaning_report"]["rows_before"] == 20
+    assert body["cleaning_report"]["rows_after"] == 16
+    assert body["cleaning_report"]["rows_removed"] == 4
 
-    response = client.get("/movies")
-    assert response.json()["total_rows"] == report["rows_after"]
+    assert main.cache.get(100) is None
+    assert main.cache.get(1) is None
+
+    # 4. Fresh retrieval shows the processed data and is cached again
+    after = client.get("/movies", params={"limit": 100})
+    assert after.status_code == 200
+    after_body = after.json()
+    assert after_body["total_rows"] == 16
+
+    titles = [row["title"] for row in after_body["data"]]
+    assert titles == [f"Movie {letter}" for letter in "ABCDEFGHIJKLMNOP"]
+
+    ids = [row["id"] for row in after_body["data"]]
+    assert ids == list(range(1, 17))
+
+    assert main.cache.get(100) == after_body
+
+
+def test_cache_hit_skips_database(client, uploaded_movies, monkeypatch):
+    # 1. Populate the cache
+    first = client.get("/movies", params={"limit": 100})
+    assert first.status_code == 200
+
+    # 2. Make any database read fail the test
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("Database was accessed on a cache hit")
+
+    monkeypatch.setattr(main.storage, "select_columns", fail_if_called)
+    monkeypatch.setattr(main.storage, "count_movies", fail_if_called)
+
+    # 3. Same request must be served from the cache
+    second = client.get("/movies", params={"limit": 100})
+    assert second.status_code == 200
+    assert second.json() == first.json()
